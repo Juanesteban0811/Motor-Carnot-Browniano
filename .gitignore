@@ -1,0 +1,15 @@
+# --- C++ / CMake ---
+build/
+*.o
+*.obj
+motor_browniano
+
+# --- Datos y figuras generados (no versionar salidas pesadas) ---
+datos/*.csv
+figuras/*.png
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
