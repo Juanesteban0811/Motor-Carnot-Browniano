@@ -23,46 +23,47 @@ from reservoirpy.nodes import Reservoir, Ridge
 
 
 # =====================================================================================
-#  PARTE 1 — SIMULACION DE KURAMOTO-SIVASHINSKY 1D  (metodo espectral IMEX)
+#  PARTE 1 — SIMULACION DE KURAMOTO-SIVASHINSKY 1D  (metodo espectral IMEX, rfft)
 # -------------------------------------------------------------------------------------
 #  Ecuacion:  u_t = -u*u_x - u_xx - u_xxxx   en dominio periodico de longitud L.
-#  Metodo IMEX (implicito-explicito): la parte LINEAL (que es la que hace "stiff" a
-#  la ecuacion) se trata de forma IMPLICITA, por lo que es INCONDICIONALMENTE estable
-#  para la rigidez -> NO explota por el dt. El termino no lineal va explicito.
+#  Metodo IMEX: la parte LINEAL (stiff) va IMPLICITA; el termino no lineal, explicito.
 #    paso:  v_nuevo = (v + dt*N(v)) / (1 - dt*Lop)
-#  Caso canonico L=22, Q=64 -> caotico. Es mas robusto que ETDRK4 y facil de verificar.
+#
+#  IMPORTANTE (bug corregido): se usa rfft/irfft en vez de fft/ifft. Con el fft
+#  complejo completo, nada obligaba al espectro a mantener la simetria hermitica (campo
+#  real); el operador lineal tiene modos inestables (k<1) y la parte espuria que rompe
+#  la simetria crecia exponencialmente desde el error de redondeo (~1e-16) hasta
+#  contaminar el campo y provocar overflow (t~363, independiente del dt). rfft/irfft
+#  guardan solo la mitad no redundante del espectro y dan un campo real por construccion.
 # =====================================================================================
 def simular_ks(L=22.0, Q=64, dt=0.05, n_pasos=20000, cada=5, transitorio=10000, semilla=1):
     rng = np.random.default_rng(semilla)
     x = L * np.arange(Q) / Q
-    k = 2.0 * np.pi * np.fft.fftfreq(Q, d=L / Q)       # numeros de onda
+    k = 2.0 * np.pi * np.fft.rfftfreq(Q, d=L / Q)      # solo k >= 0 (mitad no redundante)
     Lop = k**2 - k**4                                  # operador lineal (-u_xx - u_xxxx)
 
     # dealiasing (regla 2/3) para el termino no lineal
     kmax = np.max(np.abs(k))
     dealias = (np.abs(k) < (2.0 / 3.0) * kmax)
 
-    # factor implicito para la parte lineal (estable para cualquier dt)
-    denom = 1.0 - dt * Lop
+    denom = 1.0 - dt * Lop                             # parte lineal implicita (estable)
     g = -0.5j * k                                      # termino no lineal: -0.5*(u^2)_x
 
     u0 = 0.1 * rng.standard_normal(Q)
-    v = np.fft.fft(u0)
+    v = np.fft.rfft(u0)
 
     def paso(v):
-        y = np.real(np.fft.ifft(v))
-        Nv = g * np.fft.fft(y**2) * dealias            # termino no lineal (explicito)
+        y = np.fft.irfft(v, n=Q)                       # campo real por construccion
+        Nv = g * np.fft.rfft(y**2) * dealias           # termino no lineal (explicito)
         return (v + dt * Nv) / denom                   # parte lineal implicita
 
     for _ in range(transitorio):                       # descartar spin-up
         v = paso(v)
     U = np.zeros((n_pasos, Q))
-    fila = 0
-    while fila < n_pasos:
-        for _ in range(cada):                          # submuestreo: dt efectivo = dt*cada
+    for fila in range(n_pasos):
+        for _ in range(cada):                          # dt efectivo = dt*cada = 0.25
             v = paso(v)
-        U[fila] = np.real(np.fft.ifft(v))
-        fila += 1
+        U[fila] = np.fft.irfft(v, n=Q)
     return U, x
 
 
@@ -82,31 +83,31 @@ plt.show()
 # -------------------------------------------------------------------------------------
 #  Necesario para medir el horizonte en TIEMPOS DE LYAPUNOV. Debe salir ~0.043 (L=22).
 # =====================================================================================
-# Usa el MISMO integrador IMEX estable que la simulacion (dt interno pequeno).
+# Usa el MISMO integrador IMEX estable con rfft/irfft que la simulacion.
 def exponente_lyapunov(y0, L=22.0, Q=64, dt=0.05, n_pasos=100000, d0=1e-7, renorm=5):
-    k = 2.0 * np.pi * np.fft.fftfreq(Q, d=L / Q)
+    k = 2.0 * np.pi * np.fft.rfftfreq(Q, d=L / Q)
     Lop = k**2 - k**4
     kmax = np.max(np.abs(k)); dealias = (np.abs(k) < (2.0 / 3.0) * kmax)
     denom = 1.0 - dt * Lop
     g = -0.5j * k
 
     def paso(v):
-        y = np.real(np.fft.ifft(v))
-        Nv = g * np.fft.fft(y**2) * dealias
+        y = np.fft.irfft(v, n=Q)
+        Nv = g * np.fft.rfft(y**2) * dealias
         return (v + dt * Nv) / denom
 
-    v = np.fft.fft(y0)
+    v = np.fft.rfft(y0)
     pert = np.zeros(Q); pert[0] = d0
-    w = np.fft.fft(y0 + pert)
+    w = np.fft.rfft(y0 + pert)
     suma = 0.0; n_renorm = 0
     for i in range(1, n_pasos + 1):
         v = paso(v); w = paso(w)
         if i % renorm == 0:
-            yv = np.real(np.fft.ifft(v)); yw = np.real(np.fft.ifft(w))
+            yv = np.fft.irfft(v, n=Q); yw = np.fft.irfft(w, n=Q)
             d = np.linalg.norm(yw - yv)
             if d > 0:
                 suma += np.log(d / d0); n_renorm += 1
-                yw = yv + (yw - yv) * (d0 / d); w = np.fft.fft(yw)
+                yw = yv + (yw - yv) * (d0 / d); w = np.fft.rfft(yw)
     return suma / (n_renorm * renorm * dt)
 
 
