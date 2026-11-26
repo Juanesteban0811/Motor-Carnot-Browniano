@@ -29,11 +29,18 @@ from reservoirpy.nodes import Reservoir, Ridge
 #  Caso canonico: L=22, Q=64 -> sistema caotico. Se integra con ETDRK4 (Kassam &
 #  Trefethen 2005) porque la ecuacion es "stiff". Todo con numpy (FFT), sin shenfun.
 # =====================================================================================
-def simular_ks(L=22.0, Q=64, dt=0.25, n_pasos=20000, transitorio=2000, semilla=1):
+# NOTA: dt=0.25 con Q=64 hacia explotar la integracion (overflow -> nan). Se corrige
+# con dt mas pequeno (0.05) y DEALIASING (regla 2/3), estandar en metodos espectrales.
+# Se guarda 1 de cada 'cada' pasos para que el dt EFECTIVO de los datos sea 0.25.
+def simular_ks(L=22.0, Q=64, dt=0.05, n_pasos=20000, cada=5, transitorio=10000, semilla=1):
     rng = np.random.default_rng(semilla)
     x = L * np.arange(Q) / Q
     k = 2.0 * np.pi * np.fft.fftfreq(Q, d=L / Q)   # numeros de onda
     Lop = k**2 - k**4                              # operador lineal (-y_xx - y_xxxx) en Fourier
+
+    # --- dealiasing (regla de los 2/3): anula las frecuencias altas que desestabilizan ---
+    kmax = np.max(np.abs(k))
+    dealias = (np.abs(k) < (2.0 / 3.0) * kmax)
 
     # --- coeficientes ETDRK4 via cuadratura por contorno ---
     E  = np.exp(dt * Lop)
@@ -50,27 +57,35 @@ def simular_ks(L=22.0, Q=64, dt=0.25, n_pasos=20000, transitorio=2000, semilla=1
     v  = np.fft.fft(y0)
     g  = -0.5j * k                                 # termino no lineal: -0.5*(y^2)_x
 
+    def no_lineal(vv):
+        # termino no lineal con dealiasing aplicado a la entrada y a la salida
+        y = np.real(np.fft.ifft(vv * dealias))
+        return g * np.fft.fft(y**2) * dealias
+
     def paso(v):
-        Nv = g * np.fft.fft(np.real(np.fft.ifft(v))**2)
+        Nv = no_lineal(v)
         a  = E2 * v + Qc * Nv
-        Na = g * np.fft.fft(np.real(np.fft.ifft(a))**2)
+        Na = no_lineal(a)
         b  = E2 * v + Qc * Na
-        Nb = g * np.fft.fft(np.real(np.fft.ifft(b))**2)
+        Nb = no_lineal(b)
         c  = E2 * a + Qc * (2.0 * Nb - Nv)
-        Nc = g * np.fft.fft(np.real(np.fft.ifft(c))**2)
+        Nc = no_lineal(c)
         return E * v + Nv * f1 + 2.0 * (Na + Nb) * f2 + Nc * f3
 
     for _ in range(transitorio):                   # descartar spin-up
         v = paso(v)
     U = np.zeros((n_pasos, Q))
-    for i in range(n_pasos):
-        v = paso(v)
-        U[i] = np.real(np.fft.ifft(v))
+    fila = 0
+    while fila < n_pasos:                           # integrar y guardar 1 de cada 'cada'
+        for _ in range(cada):
+            v = paso(v)
+        U[fila] = np.real(np.fft.ifft(v))
+        fila += 1
     return U, x
 
 
-DT = 0.25
-U, x = simular_ks(L=22.0, Q=64, dt=DT, n_pasos=20000)
+DT = 0.25                                           # dt EFECTIVO de los datos (dt_interno 0.05 * cada 5)
+U, x = simular_ks(L=22.0, Q=64, dt=0.05, cada=5, n_pasos=20000)
 print("datos:", U.shape, " rango [%.2f, %.2f]" % (U.min(), U.max()))
 
 # visualizar el campo (debe verse como KS: estructuras onduladas que fluyen)
@@ -85,9 +100,11 @@ plt.show()
 # -------------------------------------------------------------------------------------
 #  Necesario para medir el horizonte en TIEMPOS DE LYAPUNOV. Debe salir ~0.043 (L=22).
 # =====================================================================================
-def exponente_lyapunov(y0, L=22.0, Q=64, dt=0.25, n_pasos=10000, d0=1e-7, renorm=5):
+# Usa el MISMO integrador estable (dt pequeno + dealiasing) que la simulacion.
+def exponente_lyapunov(y0, L=22.0, Q=64, dt=0.05, n_pasos=50000, d0=1e-7, renorm=5):
     k = 2.0 * np.pi * np.fft.fftfreq(Q, d=L / Q)
     Lop = k**2 - k**4
+    kmax = np.max(np.abs(k)); dealias = (np.abs(k) < (2.0 / 3.0) * kmax)
     E  = np.exp(dt * Lop); E2 = np.exp(dt * Lop / 2.0)
     M  = 32; r = np.exp(1j * np.pi * (np.arange(1, M + 1) - 0.5) / M)
     LR = dt * Lop[:, None] + r[None, :]
@@ -97,11 +114,15 @@ def exponente_lyapunov(y0, L=22.0, Q=64, dt=0.25, n_pasos=10000, d0=1e-7, renorm
     f3 = dt * np.real(np.mean((-4.0 - 3.0 * LR - LR**2 + np.exp(LR) * (4.0 - LR)) / LR**3, axis=1))
     g = -0.5j * k
 
+    def no_lineal(vv):
+        y = np.real(np.fft.ifft(vv * dealias))
+        return g * np.fft.fft(y**2) * dealias
+
     def paso(v):
-        Nv = g * np.fft.fft(np.real(np.fft.ifft(v))**2)
-        a = E2*v + Qc*Nv; Na = g*np.fft.fft(np.real(np.fft.ifft(a))**2)
-        b = E2*v + Qc*Na; Nb = g*np.fft.fft(np.real(np.fft.ifft(b))**2)
-        c = E2*a + Qc*(2.0*Nb - Nv); Nc = g*np.fft.fft(np.real(np.fft.ifft(c))**2)
+        Nv = no_lineal(v)
+        a = E2*v + Qc*Nv; Na = no_lineal(a)
+        b = E2*v + Qc*Na; Nb = no_lineal(b)
+        c = E2*a + Qc*(2.0*Nb - Nv); Nc = no_lineal(c)
         return E*v + Nv*f1 + 2.0*(Na+Nb)*f2 + Nc*f3
 
     v = np.fft.fft(y0)
@@ -119,7 +140,7 @@ def exponente_lyapunov(y0, L=22.0, Q=64, dt=0.25, n_pasos=10000, d0=1e-7, renorm
     return suma / (n_renorm * renorm * dt)
 
 
-lambda_max = exponente_lyapunov(U[0], dt=DT)
+lambda_max = exponente_lyapunov(U[0], dt=0.05)     # dt interno pequeno para estabilidad
 print("Lambda_max = %.4f   (referencia literatura L=22: ~0.043)" % lambda_max)
 print("tiempo de Lyapunov = %.2f" % (1.0 / lambda_max))
 
