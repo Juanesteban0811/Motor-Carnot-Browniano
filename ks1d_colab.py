@@ -25,27 +25,27 @@ from reservoirpy.nodes import Reservoir, Ridge
 # =====================================================================================
 #  PARTE 1 — SIMULACION DE KURAMOTO-SIVASHINSKY 1D  (metodo espectral ETDRK4)
 # -------------------------------------------------------------------------------------
-#  Ecuacion:  y_t = -y*y_x - y_xx - y_xxxx   en dominio periodico de longitud L.
-#  Caso canonico: L=22, Q=64 -> sistema caotico. Se integra con ETDRK4 (Kassam &
-#  Trefethen 2005) porque la ecuacion es "stiff". Todo con numpy (FFT), sin shenfun.
+#  Ecuacion:  u_t = -u*u_x - u_xx - u_xxxx   en dominio periodico.
+#  Se usa la implementacion CANONICA y PROBADA de Trefethen ("kursiv.m", 2000):
+#    - dominio L = 32*pi,  Q = 128 puntos,  dt = 0.25
+#    - condicion inicial especifica: u = cos(x/16)*(1 + sin(x/16))
+#  Estos parametros estan garantizados de ser estables y producir caos. Las versiones
+#  con L=22 + ruido daban overflow/nan: no usar.
 # =====================================================================================
-# NOTA: dt=0.25 con Q=64 hacia explotar la integracion (overflow -> nan). Se corrige
-# con dt mas pequeno (0.05) y DEALIASING (regla 2/3), estandar en metodos espectrales.
-# Se guarda 1 de cada 'cada' pasos para que el dt EFECTIVO de los datos sea 0.25.
-def simular_ks(L=22.0, Q=64, dt=0.05, n_pasos=20000, cada=5, transitorio=10000, semilla=1):
-    rng = np.random.default_rng(semilla)
-    x = L * np.arange(Q) / Q
-    k = 2.0 * np.pi * np.fft.fftfreq(Q, d=L / Q)   # numeros de onda
-    Lop = k**2 - k**4                              # operador lineal (-y_xx - y_xxxx) en Fourier
+def simular_ks(Q=128, dt=0.25, n_pasos=20000, transitorio=2000):
+    # malla espacial (dominio 0..32*pi)
+    x = 32.0 * np.pi * np.arange(1, Q + 1) / Q
+    u = np.cos(x / 16.0) * (1.0 + np.sin(x / 16.0))   # condicion inicial de Trefethen
+    v = np.fft.fft(u)
 
-    # --- dealiasing (regla de los 2/3): anula las frecuencias altas que desestabilizan ---
-    kmax = np.max(np.abs(k))
-    dealias = (np.abs(k) < (2.0 / 3.0) * kmax)
+    # numeros de onda para dominio de longitud 32*pi
+    k = np.concatenate([np.arange(0, Q // 2), [0], np.arange(-Q // 2 + 1, 0)]) / 16.0
+    Lop = k**2 - k**4                                 # operador lineal
 
-    # --- coeficientes ETDRK4 via cuadratura por contorno ---
+    # coeficientes ETDRK4 (cuadratura por contorno)
     E  = np.exp(dt * Lop)
     E2 = np.exp(dt * Lop / 2.0)
-    M  = 32
+    M  = 16
     r  = np.exp(1j * np.pi * (np.arange(1, M + 1) - 0.5) / M)
     LR = dt * Lop[:, None] + r[None, :]
     Qc = dt * np.real(np.mean((np.exp(LR / 2.0) - 1.0) / LR, axis=1))
@@ -53,39 +53,29 @@ def simular_ks(L=22.0, Q=64, dt=0.05, n_pasos=20000, cada=5, transitorio=10000, 
     f2 = dt * np.real(np.mean((2.0 + LR + np.exp(LR) * (-2.0 + LR)) / LR**3, axis=1))
     f3 = dt * np.real(np.mean((-4.0 - 3.0 * LR - LR**2 + np.exp(LR) * (4.0 - LR)) / LR**3, axis=1))
 
-    y0 = 0.01 * rng.standard_normal(Q)             # condicion inicial pequena
-    v  = np.fft.fft(y0)
-    g  = -0.5j * k                                 # termino no lineal: -0.5*(y^2)_x
-
-    def no_lineal(vv):
-        # termino no lineal con dealiasing aplicado a la entrada y a la salida
-        y = np.real(np.fft.ifft(vv * dealias))
-        return g * np.fft.fft(y**2) * dealias
+    g = -0.5j * k                                     # termino no lineal: -0.5*(u^2)_x
 
     def paso(v):
-        Nv = no_lineal(v)
+        Nv = g * np.fft.fft(np.real(np.fft.ifft(v))**2)
         a  = E2 * v + Qc * Nv
-        Na = no_lineal(a)
+        Na = g * np.fft.fft(np.real(np.fft.ifft(a))**2)
         b  = E2 * v + Qc * Na
-        Nb = no_lineal(b)
+        Nb = g * np.fft.fft(np.real(np.fft.ifft(b))**2)
         c  = E2 * a + Qc * (2.0 * Nb - Nv)
-        Nc = no_lineal(c)
+        Nc = g * np.fft.fft(np.real(np.fft.ifft(c))**2)
         return E * v + Nv * f1 + 2.0 * (Na + Nb) * f2 + Nc * f3
 
-    for _ in range(transitorio):                   # descartar spin-up
+    for _ in range(transitorio):                      # descartar spin-up
         v = paso(v)
     U = np.zeros((n_pasos, Q))
-    fila = 0
-    while fila < n_pasos:                           # integrar y guardar 1 de cada 'cada'
-        for _ in range(cada):
-            v = paso(v)
-        U[fila] = np.real(np.fft.ifft(v))
-        fila += 1
+    for i in range(n_pasos):
+        v = paso(v)
+        U[i] = np.real(np.fft.ifft(v))
     return U, x
 
 
-DT = 0.25                                           # dt EFECTIVO de los datos (dt_interno 0.05 * cada 5)
-U, x = simular_ks(L=22.0, Q=64, dt=0.05, cada=5, n_pasos=20000)
+DT = 0.25                                             # paso de tiempo de los datos
+U, x = simular_ks(Q=128, dt=DT, n_pasos=20000)
 print("datos:", U.shape, " rango [%.2f, %.2f]" % (U.min(), U.max()))
 
 # visualizar el campo (debe verse como KS: estructuras onduladas que fluyen)
@@ -100,13 +90,12 @@ plt.show()
 # -------------------------------------------------------------------------------------
 #  Necesario para medir el horizonte en TIEMPOS DE LYAPUNOV. Debe salir ~0.043 (L=22).
 # =====================================================================================
-# Usa el MISMO integrador estable (dt pequeno + dealiasing) que la simulacion.
-def exponente_lyapunov(y0, L=22.0, Q=64, dt=0.05, n_pasos=50000, d0=1e-7, renorm=5):
-    k = 2.0 * np.pi * np.fft.fftfreq(Q, d=L / Q)
+# Usa la MISMA discretizacion de Trefethen que la simulacion (dominio 32*pi, Q=128).
+def exponente_lyapunov(y0, Q=128, dt=0.25, n_pasos=20000, d0=1e-7, renorm=5):
+    k = np.concatenate([np.arange(0, Q // 2), [0], np.arange(-Q // 2 + 1, 0)]) / 16.0
     Lop = k**2 - k**4
-    kmax = np.max(np.abs(k)); dealias = (np.abs(k) < (2.0 / 3.0) * kmax)
     E  = np.exp(dt * Lop); E2 = np.exp(dt * Lop / 2.0)
-    M  = 32; r = np.exp(1j * np.pi * (np.arange(1, M + 1) - 0.5) / M)
+    M  = 16; r = np.exp(1j * np.pi * (np.arange(1, M + 1) - 0.5) / M)
     LR = dt * Lop[:, None] + r[None, :]
     Qc = dt * np.real(np.mean((np.exp(LR / 2.0) - 1.0) / LR, axis=1))
     f1 = dt * np.real(np.mean((-4.0 - LR + np.exp(LR) * (4.0 - 3.0 * LR + LR**2)) / LR**3, axis=1))
@@ -114,15 +103,11 @@ def exponente_lyapunov(y0, L=22.0, Q=64, dt=0.05, n_pasos=50000, d0=1e-7, renorm
     f3 = dt * np.real(np.mean((-4.0 - 3.0 * LR - LR**2 + np.exp(LR) * (4.0 - LR)) / LR**3, axis=1))
     g = -0.5j * k
 
-    def no_lineal(vv):
-        y = np.real(np.fft.ifft(vv * dealias))
-        return g * np.fft.fft(y**2) * dealias
-
     def paso(v):
-        Nv = no_lineal(v)
-        a = E2*v + Qc*Nv; Na = no_lineal(a)
-        b = E2*v + Qc*Na; Nb = no_lineal(b)
-        c = E2*a + Qc*(2.0*Nb - Nv); Nc = no_lineal(c)
+        Nv = g * np.fft.fft(np.real(np.fft.ifft(v))**2)
+        a = E2*v + Qc*Nv; Na = g*np.fft.fft(np.real(np.fft.ifft(a))**2)
+        b = E2*v + Qc*Na; Nb = g*np.fft.fft(np.real(np.fft.ifft(b))**2)
+        c = E2*a + Qc*(2.0*Nb - Nv); Nc = g*np.fft.fft(np.real(np.fft.ifft(c))**2)
         return E*v + Nv*f1 + 2.0*(Na+Nb)*f2 + Nc*f3
 
     v = np.fft.fft(y0)
@@ -140,8 +125,8 @@ def exponente_lyapunov(y0, L=22.0, Q=64, dt=0.05, n_pasos=50000, d0=1e-7, renorm
     return suma / (n_renorm * renorm * dt)
 
 
-lambda_max = exponente_lyapunov(U[0], dt=0.05)     # dt interno pequeno para estabilidad
-print("Lambda_max = %.4f   (referencia literatura L=22: ~0.043)" % lambda_max)
+lambda_max = exponente_lyapunov(U[0], dt=DT)
+print("Lambda_max = %.4f   (referencia literatura L=32*pi: ~0.09)" % lambda_max)
 print("tiempo de Lyapunov = %.2f" % (1.0 / lambda_max))
 
 
